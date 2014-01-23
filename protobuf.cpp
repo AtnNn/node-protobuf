@@ -1,8 +1,9 @@
 #include <v8.h>
 
 #include <node.h>
-#include <node_buffer.h>
 #include <node_object_wrap.h>
+#include <node_buffer.h>
+
 
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/descriptor.h>
@@ -12,11 +13,11 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
-#include <string> 
+#include <string>
 
 using namespace google::protobuf;
 using namespace v8;
-using node::Buffer;
+using namespace node;
 
 bool preserve_int64;
 
@@ -30,10 +31,14 @@ private:
 
   DescriptorPool *pool;
 
-  static Handle<v8::Value> New(const Arguments &args);
-  static Handle<Value> Serialize(const Arguments &args);
-  static Handle<Value> Parse(const Arguments &args);
+  static void New(const v8::FunctionCallbackInfo<Value> &args);
+  static void Serialize(const v8::FunctionCallbackInfo<Value> &args);
+  static void Parse(const v8::FunctionCallbackInfo<Value> &args);
+
+  static Persistent<Function> constructor;
 };
+
+Persistent<Function> Protobuf::constructor;
 
 Protobuf::Protobuf(DescriptorPool *pool) {
   this->pool = pool;
@@ -44,20 +49,24 @@ Protobuf::~Protobuf() {
 }
 
 void Protobuf::Init(Handle<Object> exports) {
+  Isolate* isolate = Isolate::GetCurrent();
+
   // Prepare constructor template
   Local<FunctionTemplate> tpl = FunctionTemplate::New(New);
   tpl->SetClassName(String::NewSymbol("Protobuf"));
   tpl->InstanceTemplate()->SetInternalFieldCount(1);
   // Prototype
-  tpl->PrototypeTemplate()->Set(String::NewSymbol("Serialize"), FunctionTemplate::New(Serialize)->GetFunction());
-  tpl->PrototypeTemplate()->Set(String::NewSymbol("Parse"), FunctionTemplate::New(Parse)->GetFunction());
+  NODE_SET_PROTOTYPE_METHOD(tpl, "Serialize", Serialize);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "Parse", Parse);
 
-  Persistent<Function> constructor = Persistent<Function>::New(tpl->GetFunction());
-  exports->Set(String::NewSymbol("Protobuf"), constructor);
+  constructor.Reset(isolate, tpl->GetFunction());
+
+  exports->Set(String::NewSymbol("Protobuf"), tpl->GetFunction());
 }
 
-Handle<Value> Protobuf::New(const Arguments& args) {
-  HandleScope scope;
+void Protobuf::New(const v8::FunctionCallbackInfo<Value> &args) {
+  Isolate *isolate = Isolate::GetCurrent();
+  HandleScope scope(isolate);
 
   Local<Object> buffer_obj = args[0]->ToObject();
   char *buffer_data = Buffer::Data(buffer_obj);
@@ -65,8 +74,9 @@ Handle<Value> Protobuf::New(const Arguments& args) {
 
   FileDescriptorSet descriptors;
   if (!descriptors.ParseFromArray(buffer_data, buffer_length)) {
-    return v8::ThrowException(
+    isolate->ThrowException(
         v8::Exception::Error(String::New("Malformed descriptor")));
+    return;
   }
 
   DescriptorPool* pool = new DescriptorPool;
@@ -81,7 +91,7 @@ Handle<Value> Protobuf::New(const Arguments& args) {
   Protobuf* obj = new Protobuf(pool);
   obj->Wrap(args.This());
 
-  return args.This();
+  args.GetReturnValue().Set(args.This());
 }
 
 void SerializePart(google::protobuf::Message *message, Handle<Object> subj);
@@ -247,8 +257,9 @@ void SerializePart(google::protobuf::Message *message, Handle<Object> subj) {
   }
 }
 
-Handle<Value> Protobuf::Serialize(const Arguments &args) {
-  HandleScope scope;
+void Protobuf::Serialize(const v8::FunctionCallbackInfo<Value> &args) {
+  Isolate* isolate = Isolate::GetCurrent();
+  HandleScope scope(isolate);
 
   Protobuf* obj = ObjectWrap::Unwrap<Protobuf>(args.This());
 
@@ -263,7 +274,8 @@ Handle<Value> Protobuf::Serialize(const Arguments &args) {
   if (descriptor == NULL) {
     std::string error = "Unknown schema name: " + schema_name;
     ThrowException(Exception::Error(String::New(error.c_str())));
-    return scope.Close(Undefined());
+    args.GetReturnValue().Set(scope.Close(Undefined()));
+    return;
   }
   google::protobuf::Message *message = factory.GetPrototype(descriptor)->New();
 
@@ -271,12 +283,13 @@ Handle<Value> Protobuf::Serialize(const Arguments &args) {
 
   // make JS Buffer instead of SlowBuffer
   int size = message->ByteSize();
-  Buffer *buf = Buffer::New(size);
+  Local<Object> buf = Buffer::New(size);
   bool result = message->SerializeToArray(Buffer::Data(buf), size);
 
   if (!result) {
-    return v8::ThrowException(
+    isolate->ThrowException(
         v8::Exception::Error(String::New("Can't serialize")));
+    return;
   }
 
   // // obtain Node.js Buffer constructor
@@ -290,12 +303,13 @@ Handle<Value> Protobuf::Serialize(const Arguments &args) {
   delete message;
 
   //return scope.Close(actualBuffer);
-  return scope.Close(buf->handle_);
+  args.GetReturnValue().Set(buf);
 }
 
 Handle<Object> ParsePart(const google::protobuf::Message &message);
 Handle<Value> ParseField(const google::protobuf::Message &message, const Reflection *r, const FieldDescriptor *field, int index) {
-  HandleScope scope;
+  Isolate *isolate = Isolate::GetCurrent();
+  HandleScope scope(isolate);
   Handle<Value> v;
 
   switch (field->cpp_type()) {
@@ -408,7 +422,7 @@ Handle<Value> ParseField(const google::protobuf::Message &message, const Reflect
       else
         value = r->GetString(message, field);
       if (field->type() == FieldDescriptor::TYPE_BYTES)
-        v = Buffer::New(const_cast<char *>(value.data()), value.length())->handle_;
+        v = Buffer::New(const_cast<char *>(value.data()), value.length());
       else
         v = String::New(value.c_str());
       break;
@@ -419,7 +433,8 @@ Handle<Value> ParseField(const google::protobuf::Message &message, const Reflect
 }
 
 Handle<Object> ParsePart(const google::protobuf::Message &message) {
-  HandleScope scope;
+  Isolate *isolate = Isolate::GetCurrent();
+  HandleScope scope(isolate);
 
   Handle<Object> ret = Object::New();
   // get a reflection
@@ -455,14 +470,15 @@ Handle<Object> ParsePart(const google::protobuf::Message &message) {
   return scope.Close(ret);
 }
 
-Handle<Value> Protobuf::Parse(const Arguments &args) {
-  HandleScope scope;
+void Protobuf::Parse(const v8::FunctionCallbackInfo<Value> &args) {
+  Isolate *isolate = Isolate::GetCurrent();
+  HandleScope scope(isolate);
 
   Protobuf* obj = ObjectWrap::Unwrap<Protobuf>(args.This());
 
   if (!Buffer::HasInstance(args[0])) {
-    ThrowException(Exception::Error(String::New("First argument must be a Buffer")));
-    return scope.Close(Undefined());
+    isolate->ThrowException(Exception::Error(String::New("First argument must be a Buffer")));
+    return;
   }
 
   Local<Object> buffer_obj = args[0]->ToObject();
@@ -478,7 +494,7 @@ Handle<Value> Protobuf::Parse(const Arguments &args) {
   if (descriptor == NULL) {
     std::string error = "Unknown schema name: " + schema_name;
     ThrowException(Exception::Error(String::New(error.c_str())));
-    return scope.Close(Undefined());
+    return;
   }
   google::protobuf::Message *message = factory.GetPrototype(descriptor)->New();
 
@@ -487,10 +503,10 @@ Handle<Value> Protobuf::Parse(const Arguments &args) {
   if (parseResult) {
     Handle<Object> ret = ParsePart(*message);
     delete message;
-    return scope.Close(ret);
+    args.GetReturnValue().Set(scope.Close(ret));
   } else {
     ThrowException(Exception::Error(String::New("Malformed protocol buffer")));
-    return scope.Close(Undefined());
+    return;
   }
 }
 
